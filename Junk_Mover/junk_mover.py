@@ -209,6 +209,19 @@ def paginate_playlist_items(access_token: str, playlist_id: str) -> Iterable[Dic
         params["offset"] += params["limit"]
 
 
+def follow_playlist(access_token: str, playlist_id: str) -> None:
+    """Follow (add to library) a playlist so it appears in /me/playlists on future runs."""
+    # junk_mover finds destination playlists by searching /me/playlists (followed only).
+    # Explicitly following after create/find ensures the playlist stays discoverable and
+    # prevents a new duplicate from being created if the user ever unfollows it manually.
+    spotify_request(
+        "PUT",
+        f"https://api.spotify.com/v1/playlists/{playlist_id}/followers",
+        access_token,
+        data={"public": False},
+    )
+
+
 def ensure_junk_drawer_playlist(
     access_token: str, user_id: str, name: str, description: str
 ) -> str:
@@ -223,7 +236,10 @@ def ensure_junk_drawer_playlist(
                 existing[0].get("id"),
                 len(existing) - 1,
             )
-        return existing[0]["id"]
+        playlist_id = existing[0]["id"]
+        # Re-follow to keep it in /me/playlists even if the user accidentally unfollowed it.
+        follow_playlist(access_token, playlist_id)
+        return playlist_id
 
     body = {
         "name": name,
@@ -233,8 +249,11 @@ def ensure_junk_drawer_playlist(
     created = spotify_request(
         "POST", f"https://api.spotify.com/v1/users/{user_id}/playlists", access_token, data=body
     )
-    logging.info("Created playlist %s (%s)", name, created.get("id"))
-    return created["id"]
+    playlist_id = created["id"]
+    logging.info("Created playlist %s (%s)", name, playlist_id)
+    # Explicitly follow the new playlist so it stays visible in /me/playlists.
+    follow_playlist(access_token, playlist_id)
+    return playlist_id
 
 
 def add_tracks_to_playlist(access_token: str, playlist_id: str, uris: List[str]) -> None:
