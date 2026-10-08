@@ -24,6 +24,7 @@ from urllib import error, parse, request
 ROOT = Path(__file__).resolve().parents[1]
 LOG_DIR = ROOT / "logs"
 LOG_FILE = LOG_DIR / "junk_mover.log"
+STATE_FILE = ROOT / "junk_drawer_state.json"
 
 
 def load_env_from_root() -> None:
@@ -222,11 +223,56 @@ def follow_playlist(access_token: str, playlist_id: str) -> None:
     )
 
 
+def load_state() -> Dict[str, str]:
+    """Load the persisted playlist name→ID mapping from disk."""
+    # State file survives restarts and avoids relying on /me/playlists returning private playlists
+    # (which requires the playlist-read-private scope that may not be present on the refresh token).
+    if STATE_FILE.exists():
+        try:
+            return json.loads(STATE_FILE.read_text())
+        except (json.JSONDecodeError, OSError) as exc:
+            logging.warning("Could not read state file %s: %s", STATE_FILE, exc)
+    return {}
+
+
+def save_state(state: Dict[str, str]) -> None:
+    """Persist the playlist name→ID mapping to disk for future runs."""
+    STATE_FILE.write_text(json.dumps(state, indent=2))
+    logging.debug("Saved state to %s", STATE_FILE)
+
+
 def ensure_junk_drawer_playlist(
     access_token: str, user_id: str, name: str, description: str
 ) -> str:
     """Return ID of the named Junk Drawer playlist, creating it if absent."""
-    # Create or re-use the destination playlist on-demand to keep runs idempotent.
+    # Root cause note: /me/playlists silently omits private playlists when the refresh token
+    # lacks the playlist-read-private scope. The state file caches known IDs so private
+    # junk drawer playlists are found reliably across runs without that scope.
+    state = load_state()
+
+    # 1. Check the local state file first — avoids scope-dependent API search for private playlists.
+    if name in state:
+        cached_id = state[name]
+        try:
+            spotify_request(
+                "GET",
+                f"https://api.spotify.com/v1/playlists/{cached_id}",
+                access_token,
+                params={"fields": "id"},
+            )
+            # Cached playlist still exists — re-follow and return it.
+            follow_playlist(access_token, cached_id)
+            logging.info("Found cached playlist %r (%s)", name, cached_id)
+            return cached_id
+        except RuntimeError:
+            logging.warning(
+                "Cached playlist %r (%s) no longer accessible; falling back to search.",
+                name,
+                cached_id,
+            )
+            del state[name]
+
+    # 2. Fall back to API search (works when playlist-read-private scope is present, or for public playlists).
     existing = find_playlists_by_name_owner(access_token, user_id, name)
     if existing:
         if len(existing) > 1:
@@ -239,8 +285,11 @@ def ensure_junk_drawer_playlist(
         playlist_id = existing[0]["id"]
         # Re-follow to keep it in /me/playlists even if the user accidentally unfollowed it.
         follow_playlist(access_token, playlist_id)
+        state[name] = playlist_id
+        save_state(state)
         return playlist_id
 
+    # 3. Create a new playlist and cache its ID.
     body = {
         "name": name,
         "description": description,
@@ -253,6 +302,8 @@ def ensure_junk_drawer_playlist(
     logging.info("Created playlist %s (%s)", name, playlist_id)
     # Explicitly follow the new playlist so it stays visible in /me/playlists.
     follow_playlist(access_token, playlist_id)
+    state[name] = playlist_id
+    save_state(state)
     return playlist_id
 
 

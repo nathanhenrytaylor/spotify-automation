@@ -119,7 +119,7 @@ def main() -> None:
     client_secret = os.environ["JUNK_MOVER_CLIENT_SECRET"]
 
     # Need playlist modification scopes to move tracks between playlists.
-    scope = "user-read-email user-read-private playlist-modify-public playlist-modify-private"
+    scope = "user-read-email user-read-private playlist-read-private playlist-modify-public playlist-modify-private"
     auth_url = build_authorize_url(client_id, redirect_uri, scope)
 
     print("Launching browser to authorize...")
