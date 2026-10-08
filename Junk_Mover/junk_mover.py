@@ -16,6 +16,7 @@ import json
 import logging
 import logging.handlers
 import os
+import re
 import sys
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -241,6 +242,31 @@ def save_state(state: Dict[str, str]) -> None:
     logging.debug("Saved state to %s", STATE_FILE)
 
 
+_JUNK_DRAWER_PATTERN = re.compile(r"^\d{2} Junk Drawer$", re.IGNORECASE)
+
+
+def reconcile_state(access_token: str, user_id: str) -> Dict[str, str]:
+    """Scan all user playlists for Junk Drawer entries and return a rebuilt state dict.
+
+    Called when the state file is missing or empty. Paginates /me/playlists to find any
+    playlists matching the '<YY> Junk Drawer' pattern owned by this user, rebuilding the
+    name->ID map so ensure_junk_drawer_playlist won't create duplicates on a fresh state.
+    Note: requires playlist-read-private scope to see private junk drawers; if that scope
+    is absent only public ones will be found here. Add playlist-read-private and reauth
+    to make reconciliation fully effective.
+    """
+    found: Dict[str, str] = {}
+    for playlist in paginate_playlists(access_token):
+        name = (playlist.get("name") or "").strip()
+        if (
+            _JUNK_DRAWER_PATTERN.match(name)
+            and playlist.get("owner", {}).get("id") == user_id
+        ):
+            found[name] = playlist["id"]
+            logging.info("Reconciled junk drawer: %r -> %s", name, playlist["id"])
+    return found
+
+
 def ensure_junk_drawer_playlist(
     access_token: str, user_id: str, name: str, description: str
 ) -> str:
@@ -430,6 +456,26 @@ def main() -> None:
     me = get_current_user(access_token)
     user_id = me.get("id")
     logging.info("Authenticated as %s", me.get("display_name") or user_id)
+
+    # Reconcile state file if it is missing or empty. This prevents duplicate playlist
+    # creation when the state file is wiped — it re-scans /me/playlists for any existing
+    # Junk Drawer playlists and rebuilds the cache before any moves are attempted.
+    existing_state = load_state()
+    if not existing_state:
+        logging.info(
+            "State file is empty or missing; reconciling junk drawer state from Spotify API."
+        )
+        reconciled = reconcile_state(access_token, user_id)
+        if reconciled:
+            save_state(reconciled)
+            logging.info(
+                "Reconciliation complete: cached %d junk drawer playlist(s).", len(reconciled)
+            )
+        else:
+            logging.info(
+                "Reconciliation found no existing junk drawer playlists "
+                "(state file wiped on a fresh account, or playlist-read-private scope is missing)."
+            )
 
     # Locate the source playlist owned by this user; abort if not found.
     source_playlist = find_playlist_by_name_owner(access_token, user_id, source_playlist_name)
