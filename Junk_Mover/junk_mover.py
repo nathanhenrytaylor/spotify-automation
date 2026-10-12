@@ -28,6 +28,14 @@ LOG_FILE = LOG_DIR / "junk_mover.log"
 STATE_FILE = ROOT / "junk_drawer_state.json"
 
 
+class SpotifyHTTPError(RuntimeError):
+    """Raised for Spotify API HTTP errors; carries the numeric status code."""
+
+    def __init__(self, status: int, detail: str) -> None:
+        super().__init__(f"Spotify API error {status}: {detail}")
+        self.status = status
+
+
 def load_env_from_root() -> None:
     """Load .env values from the project root into os.environ if present."""
     # Keep secrets/config centralized in the repo-level .env for portability.
@@ -125,7 +133,7 @@ def spotify_request(
         raise RuntimeError("Spotify API returned non-JSON body") from exc
     except error.HTTPError as exc:
         detail = exc.read().decode()
-        raise RuntimeError(f"Spotify API error {exc.status}: {detail}") from exc
+        raise SpotifyHTTPError(exc.status, detail) from exc
     except error.URLError as exc:
         raise RuntimeError(f"Network error calling Spotify: {exc.reason}") from exc
 
@@ -290,13 +298,32 @@ def ensure_junk_drawer_playlist(
             follow_playlist(access_token, cached_id)
             logging.info("Found cached playlist %r (%s)", name, cached_id)
             return cached_id
+        except SpotifyHTTPError as exc:
+            if exc.status == 404:
+                logging.warning(
+                    "Cached playlist %r (%s) returned 404; removing from cache and searching.",
+                    name,
+                    cached_id,
+                )
+                del state[name]
+            else:
+                # Transient error (429, 5xx, etc.) — do NOT invalidate the cache.
+                # Re-raise so we fail loudly instead of silently creating a duplicate.
+                logging.error(
+                    "Cached playlist %r (%s) check failed with %s; aborting to avoid creating duplicate.",
+                    name,
+                    cached_id,
+                    exc.status,
+                )
+                raise
         except RuntimeError:
-            logging.warning(
-                "Cached playlist %r (%s) no longer accessible; falling back to search.",
+            # Network-level or non-HTTP error — same policy: keep cache, fail loudly.
+            logging.error(
+                "Cached playlist %r (%s) check failed with a network error; aborting.",
                 name,
                 cached_id,
             )
-            del state[name]
+            raise
 
     # 2. Fall back to API search (works when playlist-read-private scope is present, or for public playlists).
     existing = find_playlists_by_name_owner(access_token, user_id, name)
